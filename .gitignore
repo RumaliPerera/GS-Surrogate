@@ -1,0 +1,24 @@
+# Python
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+*.egg-info/
+
+# Experiment outputs
+examples/benchmarks/results/
+results/
+
+# Dataset files (large simulation data, not tracked in git)
+datasets/
+
+# The upstream gsplat copy (we ship our modified gsplat/ at the root instead)
+examples/gsplat/
+
+# Logs
+*.log
+nohup.out
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
