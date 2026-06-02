@@ -28,6 +28,8 @@ conda create -n gs python=3.10
 conda activate gs
 ```
 
+A C++ compiler (GCC 9+) is required to build the CUDA extensions. If you get compilation errors, make sure `gcc` is on your PATH.
+
 Install PyTorch (adjust for your CUDA version):
 
 ```bash

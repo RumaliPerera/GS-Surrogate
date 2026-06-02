@@ -18,6 +18,7 @@ viser==0.2.7
 git+https://github.com/nerfstudio-project/nerfview@4538024fe0d15fd1a0e4d760f3695fc44ca72787
 
 # Training utilities
+ninja
 tqdm==4.67.1
 tyro>=0.8.8
 tensorboard==2.20.0

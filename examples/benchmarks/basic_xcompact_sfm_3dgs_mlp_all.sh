@@ -5,10 +5,10 @@ RENDER_TRAJ_PATH="ellipse"
 
 
 FOLDER="SfM_3DGS_Deform_mlp_all"
-DATASET="${DATASET:-../../datasets/XCompact_Dataset}"
+DATASET="${DATASET:-../XCompact_Dataset}"
 
 
-mkdir $RESULT_DIR/$FOLDER
+mkdir -p $RESULT_DIR/$FOLDER
 
 
 
