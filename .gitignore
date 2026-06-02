@@ -8,9 +8,6 @@
 examples/benchmarks/results/
 results/
 
-# Dataset files (large simulation data, not tracked in git)
-datasets/
-
 # The upstream gsplat copy (we ship our modified gsplat/ at the root instead)
 examples/gsplat/
 
