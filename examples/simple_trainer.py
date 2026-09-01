@@ -36,12 +36,13 @@ from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy.ops import remove as strategy_remove
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 
 # Conditional 4DGS imports
-from conditional_dataset import ConditionalParser, ConditionalDataset
+from conditional_dataset import ConditionalParser, ConditionalDataset, preload_to_memory
 from deformation_model import create_deformation_field #, create_hexplane_deformation_field
 CONDITIONAL_AVAILABLE = True
 
@@ -50,11 +51,8 @@ CONDITIONAL_AVAILABLE = True
 class Config:
     # Disable viewer
     disable_viewer: bool = False
-    # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
-    # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
-    # Render trajectory path
     render_traj_path: str = "interp"
 
     # Path to the Mip-NeRF 360 dataset
@@ -92,13 +90,19 @@ class Config:
     save_ply: bool = False
     # Steps to save the model as ply
     ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
-    # Whether to disable video generation during training and evaluation
+    render_save_per_condition: int = 1
+    render_save_conditions: int = 3
+    eval_train_unseen: bool = True
+    eval_train_seen: bool = True
+    eval_holdout_unseen: bool = True
+    eval_holdout_seen: bool = True
+    skip_stage1: bool = False
     disable_video: bool = False
 
     # Initialization strategy
     init_type: str = "sfm"
     # Initial number of GSs. Ignored if using sfm
-    init_num_pts: int = 2000 #100_000
+    init_num_pts: int = 2000 
     # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
     init_extent: float = 3.0
     # Degree of spherical harmonics
@@ -123,21 +127,15 @@ class Config:
     strategy: Union[DefaultStrategy, MCMCStrategy] = field(
         default_factory=DefaultStrategy
     )
-    # Stage-1 aggressive densification overrides (DefaultStrategy only)
-    # Lower grow_grad2d → more splits in high-gradient regions
+
     stage1_grow_grad2d: float = 0.0001
-    # Densify every N steps (default 100 is conservative)
     stage1_refine_every: int = 50
 
     stage1_disable_pruning: bool = False
     
-    # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
     packed: bool = False
-    # Use sparse gradients for optimization. (experimental)
     sparse_grad: bool = False
-    # Use visible adam from Taming 3DGS. (experimental)
     visible_adam: bool = False
-    # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
 
     # Use random background for training to discourage transparency
@@ -181,9 +179,7 @@ class Config:
     # Regularization for appearance optimization as weight decay
     app_opt_reg: float = 1e-6
 
-    # Enable bilateral grid. (experimental)
     use_bilateral_grid: bool = False
-    # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
     # Enable depth loss. (experimental)
@@ -216,44 +212,31 @@ class Config:
     deform_hidden_dim: int = 128
     # Learning rate for deformation network
     deform_lr: float = 1e-3
-    # Deformation magnitude scaling (smaller = more stable training)
     deform_scale: float = 0.1
-    # Regularization weight for small deformations (0 = disabled)
     deform_reg: float = 0.0
     # Path to names.txt file containing condition vectors
     names_file: str = "names.txt"
 
-    # condition_dim: int = 3
     
     # ========================================================================
     # Two-Stage Training
     # ========================================================================
-    # Reference condition index for stage 1 (canonical field training)
-    # If set to -1, then use all conditions from the start (single-stage)
     reference_condition: int = 0
-    # Step to start stage 2 (deformation training). Before this, only trains on reference.
-    # If set to 0, then skip stage 1 (train deformation from the start)
     deform_start_step: int = 5000
     # Whether to freeze canonical Gaussians in stage 2
     freeze_canonical_in_stage2: bool = False
-    # Learning rate multiplier for canonical Gaussians in stage 2 (1.0 = same as stage 1, 0.1 = 10x smaller)
     stage2_canonical_lr_scale: float = 0.3
-    # Whether to learn per-Gaussian alpha (opacity adjustment) in deformation
     learn_deform_alpha: bool = False
-    # Whether to learn per-Gaussian SH (color) adjustment in deformation
     learn_deform_sh: bool = False
-    # Load checkpoint for splats only (to initialize canonical field from previous training)
+    use_adapter: bool = True
+    max_gaussians: Optional[int] = None
     init_ckpt: Optional[str] = None
     
     # ========================================================================
     # Condition Train/Test Split
     # ========================================================================
-    # Number of conditions to hold out for testing (0 = use all for training)
     num_holdout_conditions: int = 0
-    # Specific condition indices to hold out (override num_holdout_conditions)
-    # Example: "80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,97,98,99"
     holdout_conditions: Optional[str] = None
-    # Random seed for selecting holdout conditions (if num_holdout_conditions > 0)
     holdout_seed: int = 42
 
     # ========================================================================
@@ -324,6 +307,7 @@ def create_splats_with_optimizers(
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
+
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
 
@@ -363,10 +347,7 @@ def create_splats_with_optimizers(
         params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
-    # Scale learning rate based on batch size, reference:
-    # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
-    # Note that this would not make the training exactly equivalent, see
-    # https://arxiv.org/pdf/2402.18824v1
+
     BS = batch_size * world_size
     optimizer_class = None
     if sparse_grad:
@@ -434,7 +415,7 @@ class Runner:
                     )
                     new_state[key] = torch.cat([val, padding], dim=0)
                 else:
-                    new_state[key] = val  
+                    new_state[key] = val  # scalar tensor (step), int, etc.
 
             # Swap references
             if old_param in opt.state:
@@ -445,7 +426,18 @@ class Runner:
 
     @torch.no_grad()
     def _force_split_high_error(self, step: int, trainset, cfg):
+        """
+        Periodically force-split large Gaussians that cover high-error pixels.
 
+        1.  Render ``num_views`` training images without deformation.
+        2.  Project every Gaussian centre onto each view and look up the
+            per-pixel MSE at that location.
+        3.  Keep the *max* error across views as the Gaussian's error score.
+        4.  Split Gaussians whose error AND scale both exceed their respective
+            percentile thresholds.
+        5.  Split = modify parent in-place (→ child 1) + append child 2.
+            Optimizer momentum is preserved for child 1; child 2 starts fresh.
+        """
         device = self.device
         means = self.splats["means"]
         N = means.shape[0]
@@ -665,24 +657,25 @@ class Runner:
                 patch_size=cfg.patch_size, # ignore 
                 condition_indices=self.train_conditions,  # Only train conditions
             )
-            # Validation set = train conditions, unseen views (for eval during training)
             self.valset = ConditionalDataset(
                 self.parser, 
                 split="val",
                 condition_indices=self.train_conditions,  # Val on train conditions
             )
             
-            # Train conditions on seen views
+            # Train conditions on SEEN views
             self.testset_train_seen = ConditionalDataset(
                 self.parser,
                 split="train",  # Same cameras as training
                 condition_indices=self.train_conditions,
             )
-            # Train conditions on unseen views
+            # Train conditions on UNSEEN views
             self.testset_train_unseen = self.valset  # Same as valset
-
             
-            # Create test datasets for holdout conditions 
+            print(f"  Train condition test sets:")
+            print(f"    - Seen views (train cameras): {len(self.testset_train_seen)} samples")
+            print(f"    - Unseen views (val cameras): {len(self.testset_train_unseen)} samples")
+            
             if self.test_conditions:
                 self.testset_holdout_unseen = ConditionalDataset(
                     self.parser,
@@ -694,14 +687,17 @@ class Runner:
                     split="train",  # train cameras (seen during training)
                     condition_indices=self.test_conditions,
                 )
+                print(f"  Holdout condition test sets:")
+                print(f"    - Seen views (train cameras): {len(self.testset_holdout_seen)} samples")
+                print(f"    - Unseen views (val cameras): {len(self.testset_holdout_unseen)} samples")
             else:
                 self.testset_holdout_unseen = None
                 self.testset_holdout_seen = None
             
             self.condition_dim = self.parser.condition_dim
             print(f"Conditional mode: {self.parser.num_conditions} total conditions, dim={self.condition_dim}")
-            print(f" - Training samples: {len(self.trainset)}")
-            print(f" - Validation samples: {len(self.valset)}")
+            print(f"  Training samples: {len(self.trainset)}")
+            print(f"  Validation samples: {len(self.valset)}")
         else:
             # Standard single-scene loading
             if cfg.use_deformation and not CONDITIONAL_AVAILABLE:
@@ -847,12 +843,17 @@ class Runner:
                 learn_alpha=cfg.learn_deform_alpha,
                 learn_sh=cfg.learn_deform_sh,
                 sh_dim=((cfg.sh_degree + 1) ** 2) * 3,
+                use_adapter=cfg.use_adapter,
             ).to(self.device)
 
+            
             self.deform_optimizers = [
                 torch.optim.Adam(
                     self.deform_field.parameters(),
                     lr=cfg.deform_lr * math.sqrt(cfg.batch_size),
+                    # The MLP has many small parameter tensors; fused=True
+                    # updates them in one CUDA kernel instead of many.
+                    fused=(self.device.startswith("cuda")),
                 )
             ]
             
@@ -865,26 +866,53 @@ class Runner:
 
         # ====================================================================
         # Load initial checkpoint (for canonical Gaussians)
+        # This allows starting stage 2 with pre-trained reference/canonical field
         # ====================================================================
+        # step_offset to resume stage 2 from, so a stage-2 checkpoint
+        # continues its step count / LR schedule instead of restarting at 0.
+        # Stays 0 for the normal stage1->stage2 handoff case (init_ckpt is a
+        # stage-1 checkpoint, or unset).
+        self._resume_step_offset = 0
+        self._resume_sample_losses = None
         if cfg.init_ckpt is not None:
             print(f"\nLoading initial checkpoint from: {cfg.init_ckpt}")
             ckpt = torch.load(cfg.init_ckpt, map_location=self.device, weights_only=True)
-            
+
             # Load splats (canonical Gaussians)
             if "splats" in ckpt:
                 for k in self.splats.keys():
                     if k in ckpt["splats"]:
                         self.splats[k].data = ckpt["splats"][k]
                 print(f"  Loaded canonical Gaussians: {len(self.splats['means'])} points")
-            
+
             # Optionally: load deformation field if it exists
             if cfg.use_deformation and self.deform_field is not None:
                 if "deform_field" in ckpt:
                     self.deform_field.load_state_dict(ckpt["deform_field"])
                     print("  Loaded deformation field")
+
+                    # A stage-2 checkpoint carries its own step count — pick
+                    # up stage 2 from there instead of restarting the step
+                    # counter (and LR schedule) at step_offset 0.
+                    if ckpt.get("stage") == 2 and "step" in ckpt:
+                        resumed_step = int(ckpt["step"])
+                        self._resume_step_offset = max(
+                            0, resumed_step + 1 - cfg.deform_start_step
+                        )
+                        print(f"  Resuming stage 2 at step {resumed_step + 1} "
+                              f"(step_offset {self._resume_step_offset})")
+
+                        if "optimizers" in ckpt:
+                            for name, state in ckpt["optimizers"].items():
+                                if name in self.optimizers:
+                                    self.optimizers[name].load_state_dict(state)
+                            for opt, state in zip(self.deform_optimizers, ckpt.get("deform_optimizers", [])):
+                                opt.load_state_dict(state)
+                            self._resume_sample_losses = ckpt.get("sample_losses")
+                            print("  Restored optimizer momentum and sampler weights")
                 else:
                     print("  No deformation field in checkpoint (will train from scratch)")
-            
+
             print("")
 
         # Losses & Metrics.
@@ -913,6 +941,77 @@ class Runner:
                 mode="training",
             )
 
+        # ====================================================================
+        # Report Model Statistics
+        # ====================================================================
+        self._report_model_stats()
+
+    def _report_model_stats(self):
+        """Report number of parameters, model size, and memory usage."""
+        cfg = self.cfg
+        
+        print(f"\n{'='*70}")
+        print("MODEL STATISTICS")
+        print(f"{'='*70}")
+        
+        # Canonical Gaussians
+        num_gaussians = len(self.splats["means"])
+        gaussian_params = sum(p.numel() for p in self.splats.values())
+        gaussian_size_mb = sum(p.numel() * p.element_size() for p in self.splats.values()) / (1024**2)
+        
+        print(f"\n[Canonical Gaussians]")
+        print(f"  Number of Gaussians: {num_gaussians:,}")
+        print(f"  Parameters: {gaussian_params:,}")
+        print(f"  Model size: {gaussian_size_mb:.2f} MB")
+        
+        # Per-Gaussian breakdown
+        print(f"  Breakdown:")
+        for name, param in self.splats.items():
+            param_count = param.numel()
+            param_size = param.numel() * param.element_size() / (1024**2)
+            print(f"    {name}: {list(param.shape)} = {param_count:,} params ({param_size:.2f} MB)")
+        
+        # Deformation Field
+        if self.deform_field is not None:
+            deform_params = sum(p.numel() for p in self.deform_field.parameters())
+            deform_trainable = sum(p.numel() for p in self.deform_field.parameters() if p.requires_grad)
+            deform_size_mb = sum(p.numel() * p.element_size() for p in self.deform_field.parameters()) / (1024**2)
+            
+            print(f"\n[Deformation Model]")
+            print(f"  Total parameters: {deform_params:,}")
+            print(f"  Trainable parameters: {deform_trainable:,}")
+            print(f"  Model size: {deform_size_mb:.2f} MB")
+            print(f"  Learn alpha: {cfg.learn_deform_alpha}")
+            print(f"  Learn SH: {cfg.learn_deform_sh}")
+        
+        # Total:
+        total_params = gaussian_params
+        total_trainable = gaussian_params
+        total_size_mb = gaussian_size_mb
+        
+        if self.deform_field is not None:
+            total_params += deform_params
+            total_trainable += deform_trainable
+            total_size_mb += deform_size_mb
+        
+        print(f"\n[Total]")
+        print(f"  Total parameters: {total_params:,}")
+        print(f"  Total trainable: {total_trainable:,}")
+        print(f"  Total model size: {total_size_mb:.2f} MB")
+        
+        # GPU memory:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_allocated() / (1024**3)
+            reserved = torch.cuda.memory_reserved() / (1024**3)
+            max_allocated = torch.cuda.max_memory_allocated() / (1024**3)
+            
+            print(f"\n[GPU Memory]")
+            print(f"  Allocated: {allocated:.2f} GB")
+            print(f"  Reserved: {reserved:.2f} GB")
+            print(f"  Max allocated: {max_allocated:.2f} GB")
+        
+        print(f"{'='*70}\n")
 
     def rasterize_splats(
         self,
@@ -927,7 +1026,6 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         means = self.splats["means"]  # [N, 3]
-        # rasterization does normalization internally
         quats = self.splats["quats"]  # [N, 4]
         scales = self.splats["scales"]  # [N, 3]
         opacities_logit = self.splats["opacities"]  # [N,]
@@ -1036,8 +1134,11 @@ class Runner:
         print(f"{'='*70}\n")
         
         # ==================== Stage 1 ====================
-        self._run_stage1()
-        
+        if cfg.skip_stage1:
+            print("Skipping Stage 1 (using init_ckpt's canonical Gaussians as-is)\n")
+        else:
+            self._run_stage1()
+
         # ==================== Stage 2 ====================
         self._run_stage2()
 
@@ -1093,7 +1194,6 @@ class Runner:
             self.parser, split="train", patch_size=cfg.patch_size,
             condition_indices=self.train_conditions, 
         )
-        
 
 
         ####### Validation datasets ######
@@ -1127,7 +1227,8 @@ class Runner:
             )
         
         # Training loop
-        pbar = tqdm.tqdm(range(stage1_steps), desc="Stage 1")
+
+        pbar = tqdm.tqdm(range(stage1_steps), desc="Stage 1", mininterval=5.0)
         for step in pbar:
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
@@ -1236,6 +1337,19 @@ class Runner:
                           f"Split {n_split} Gaussians → "
                           f"total {len(self.splats['means'])}\n")
 
+
+            if cfg.max_gaussians is not None:
+                n_gs = len(self.splats["means"])
+                if n_gs > cfg.max_gaussians:
+                    opacities = torch.sigmoid(self.splats["opacities"])
+                    _, keep_idx = torch.topk(opacities, cfg.max_gaussians, largest=True)
+                    keep_mask = torch.zeros(n_gs, dtype=torch.bool, device=opacities.device)
+                    keep_mask[keep_idx] = True
+                    strategy_remove(
+                        params=self.splats, optimizers=self.optimizers,
+                        state=self.strategy_state, mask=~keep_mask,
+                    )
+
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
                 try:
@@ -1250,14 +1364,15 @@ class Runner:
         print(f"\n--- Stage 1 Complete: Evaluating on reference condition ---")
         self._eval_stage1(stage1_steps - 1, stage1_valset)
         
+        # Report updated stats after densification
+        self._report_model_stats()
         
         # Save Stage 1 checkpoint
         ckpt_data = {"step": stage1_steps - 1, "splats": self.splats.state_dict(), "stage": 1}
         torch.save(ckpt_data, f"{self.ckpt_dir}/ckpt_stage1_rank{self.world_rank}.pt")
         print(f"Stage 1 checkpoint saved\n")
         
-        # Restore original strategy params (densification is off in stage 2 anyway,
-        # but keeps state clean)
+
         if isinstance(cfg.strategy, DefaultStrategy):
             cfg.strategy.grow_grad2d = _orig_grow_grad2d
             cfg.strategy.refine_every = _orig_refine_every
@@ -1291,119 +1406,179 @@ class Runner:
         # Use full dataset (all conditions) with loss-weighted sampling
         resample_every = 2000
         num_samples = len(self.trainset)
-        sample_losses = torch.ones(num_samples)
 
-        def _make_loader(weights):
-            sampler = torch.utils.data.WeightedRandomSampler(
-                weights, num_samples=num_samples, replacement=True,
-            )
-            return torch.utils.data.DataLoader(
-                self.trainset, batch_size=cfg.batch_size, sampler=sampler,
-                num_workers=4, persistent_workers=True, pin_memory=True,
-            )
 
-        trainloader = _make_loader(sample_losses)
-        trainloader_iter = iter(trainloader)
+        use_memory_cache = cfg.batch_size == 1
+        if use_memory_cache:
+            print("Preloading stage-2 training split into memory...")
+            cache = preload_to_memory(self.trainset)
+            cache_images = cache["images"].pin_memory()
+            cache_camtoworlds = cache["camtoworlds"].pin_memory()
+            cache_Ks = cache["Ks"].pin_memory()
+            cache_condition_vectors = cache["condition_vectors"].pin_memory()
+            cache_condition_idx = cache["condition_idx"]
+            cache_camera_idx = cache["camera_idx"]
+            cache_gb = cache_images.element_size() * cache_images.nelement() / 1e9
+            print(f"  Cached {num_samples} samples ({cache_gb:.2f} GB, pinned)")
+
+
+            if self._resume_sample_losses is not None and len(self._resume_sample_losses) == num_samples:
+                sample_losses = self._resume_sample_losses.clone().to(device)
+            else:
+                sample_losses = torch.ones(num_samples, device=device)
+            sample_weights = torch.ones(num_samples)
+        else:
+            if self._resume_sample_losses is not None and len(self._resume_sample_losses) == num_samples:
+                sample_losses = self._resume_sample_losses.clone()
+            else:
+                sample_losses = torch.ones(num_samples)
+
+            def _make_loader(weights):
+                sampler = torch.utils.data.WeightedRandomSampler(
+                    weights, num_samples=num_samples, replacement=True,
+                )
+                return torch.utils.data.DataLoader(
+                    self.trainset, batch_size=cfg.batch_size, sampler=sampler,
+                    num_workers=4, persistent_workers=True, pin_memory=True,
+                )
+
+            trainloader = _make_loader(sample_losses)
+            trainloader_iter = iter(trainloader)
         
-        # Schedulers for stage-2
+
+        gamma = 0.1 ** (1.0 / stage2_steps)
         schedulers = []
         if not cfg.freeze_canonical_in_stage2:
             # Reduce LR for canonical Gaussians in stage-2 using "stage2_canonical_lr_scale"
             lr_scale = cfg.stage2_canonical_lr_scale
+            start_lr = cfg.means_lr * lr_scale * math.sqrt(cfg.batch_size)
             for param_group in self.optimizers["means"].param_groups:
-                param_group['lr'] = cfg.means_lr * lr_scale * math.sqrt(cfg.batch_size)
-            print(f"Stage 2 canonical LR scale: {lr_scale} (means_lr = {cfg.means_lr * lr_scale * math.sqrt(cfg.batch_size):.6f})")
+                param_group['lr'] = start_lr
+                param_group['initial_lr'] = start_lr
+            print(f"Stage 2 canonical LR scale: {lr_scale} (means_lr = {start_lr:.6f})")
             schedulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(
-                    self.optimizers["means"], gamma=0.1 ** (1.0 / stage2_steps)
+                    self.optimizers["means"], gamma=gamma,
+                    last_epoch=self._resume_step_offset,
                 )
             )
-        
+
         # Deformation scheduler
         if self.deform_optimizers:
+            for param_group in self.deform_optimizers[0].param_groups:
+                param_group.setdefault('initial_lr', param_group['lr'])
             schedulers.append(
                 torch.optim.lr_scheduler.ExponentialLR(
-                    self.deform_optimizers[0], gamma=0.1 ** (1.0 / stage2_steps)
+                    self.deform_optimizers[0], gamma=gamma,
+                    last_epoch=self._resume_step_offset,
                 )
             )
         
-        # Training loop
-        pbar = tqdm.tqdm(range(stage2_steps), desc="Stage 2")
+
+
+        if self._resume_step_offset > 0:
+            print(f"Resuming stage 2 loop at step_offset={self._resume_step_offset} "
+                  f"(skipping already-completed steps).")
+        pbar = tqdm.tqdm(
+            range(self._resume_step_offset, stage2_steps),
+            initial=self._resume_step_offset,
+            total=stage2_steps,
+            desc="Stage 2",
+            mininterval=5.0,
+        )
         for step_offset in pbar:
             step = cfg.deform_start_step + step_offset
-            
+
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
                 self.viewer.lock.acquire()
                 tic = time.time()
 
-            try:
-                data = next(trainloader_iter)
-            except StopIteration:
-                trainloader_iter = iter(trainloader)
-                data = next(trainloader_iter)
+            if use_memory_cache:
+                idx = int(torch.multinomial(sample_weights, 1))
+                camtoworlds = cache_camtoworlds[idx : idx + 1].to(device, non_blocking=True)
+                Ks = cache_Ks[idx : idx + 1].to(device, non_blocking=True)
+                pixels = cache_images[idx : idx + 1].to(device, non_blocking=True).float() / 255.0
+                image_ids = cache_camera_idx[idx : idx + 1].to(device, non_blocking=True)
+                masks = None
+                condition_vector = cache_condition_vectors[idx : idx + 1].to(device, non_blocking=True)
+                condition_idx = int(cache_condition_idx[idx])
+            else:
+                try:
+                    data = next(trainloader_iter)
+                except StopIteration:
+                    trainloader_iter = iter(trainloader)
+                    data = next(trainloader_iter)
 
-            camtoworlds = data["camtoworld"].to(device)
-            Ks = data["K"].to(device)
-            pixels = data["image"].to(device) / 255.0
+                camtoworlds = data["camtoworld"].to(device)
+                Ks = data["K"].to(device)
+                pixels = data["image"].to(device) / 255.0
+                image_ids = data["image_id"].to(device)
+                masks = data["mask"].to(device) if "mask" in data else None
+
+                # Get condition
+                condition_vector = data["condition_vector"].to(device)
+                condition_idx = data["condition_idx"]
+                if isinstance(condition_idx, torch.Tensor):
+                    condition_idx = condition_idx.item()
+
             num_train_rays_per_step = pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
-            image_ids = data["image_id"].to(device)
-            masks = data["mask"].to(device) if "mask" in data else None
             height, width = pixels.shape[1:3]
-            
-            # Get condition
-            condition_vector = data["condition_vector"].to(device)
-            condition_idx = data["condition_idx"]
-            if isinstance(condition_idx, torch.Tensor):
-                condition_idx = condition_idx.item()
 
-            # Forward WITH deformation
-            renders, alphas, info = self.rasterize_splats(
-                camtoworlds=camtoworlds, Ks=Ks, width=width, height=height,
-                sh_degree=cfg.sh_degree, near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane, image_ids=image_ids,
-                condition_vector=condition_vector,  # Apply deformation!
-                render_mode="RGB", masks=masks,
-            )
-            colors = renders[..., 0:3]
 
-            if cfg.random_bkgd:
-                bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
-                
-            elif cfg.white_bkgd:
-                colors = colors + (1.0 - alphas)
-
-            # Loss
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-
-            # Deformation regularization
-            if cfg.deform_reg > 0.0 and self.deform_field is not None:
-                deform_reg_loss = self.deform_field.get_regularization_loss(
-                    self.splats["means"].detach(), condition_vector[0]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                renders, alphas, info = self.rasterize_splats(
+                    camtoworlds=camtoworlds, Ks=Ks, width=width, height=height,
+                    sh_degree=cfg.sh_degree, near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane, image_ids=image_ids,
+                    condition_vector=condition_vector,  # Apply deformation!
+                    render_mode="RGB", masks=masks,
                 )
-                loss = loss + cfg.deform_reg * deform_reg_loss
+                colors = renders[..., 0:3]
+
+                if cfg.random_bkgd:
+                    bkgd = torch.rand(1, 3, device=device)
+                    colors = colors + bkgd * (1.0 - alphas)
+
+                elif cfg.white_bkgd:
+                    colors = colors + (1.0 - alphas)
+
+                # Loss
+                l1loss = F.l1_loss(colors, pixels)
+                ssimloss = 1.0 - fused_ssim(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+                )
+                loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+
+                # Deformation regularization
+                if cfg.deform_reg > 0.0 and self.deform_field is not None:
+                    deform_reg_loss = self.deform_field.get_regularization_loss(
+                        self.splats["means"].detach(), condition_vector[0]
+                    )
+                    loss = loss + cfg.deform_reg * deform_reg_loss
 
             loss.backward()
-            pbar.set_description(f"Stage 2 | loss={loss.item():.4f} | cond={condition_idx}")
 
-            # Track per-sample loss for weighted resampling
-            if "sample_idx" in data:
+
+            if step_offset % 20 == 0 or step_offset == stage2_steps - 1:
+                pbar.set_description(f"Stage 2 | loss={loss.item():.4f} | cond={condition_idx}")
+
+            if use_memory_cache:
+                sample_losses[idx] = loss.detach()
+            elif "sample_idx" in data:
                 sidx = data["sample_idx"]
                 if isinstance(sidx, torch.Tensor):
                     sidx = sidx.item()
                 sample_losses[sidx] = loss.item()
 
-            # Rebuild sampler so high-error samples get drawn more often
             if step_offset > 0 and step_offset % resample_every == 0:
-                weights = sample_losses ** cfg.hard_mining_exponent
-                trainloader = _make_loader(weights)
-                trainloader_iter = iter(trainloader)
+                if use_memory_cache:
+                    sample_weights = (sample_losses ** cfg.hard_mining_exponent).cpu()
+                else:
+                    weights = sample_losses ** cfg.hard_mining_exponent
+                    trainloader = _make_loader(weights)
+                    trainloader_iter = iter(trainloader)
                 top5 = sample_losses.topk(5).values.tolist()
                 print(f"\n  [Resample] step {step}: rebuilt sampler, "
                       f"top-5 losses: {[f'{v:.4f}' for v in top5]}")
@@ -1434,7 +1609,14 @@ class Runner:
 
             # Checkpoints
             if step in [i - 1 for i in cfg.save_steps] or step_offset == stage2_steps - 1:
-                ckpt_data = {"step": step, "splats": self.splats.state_dict(), "stage": 2}
+                ckpt_data = {
+                    "step": step,
+                    "splats": self.splats.state_dict(),
+                    "stage": 2,
+                    "optimizers": {k: v.state_dict() for k, v in self.optimizers.items()},
+                    "deform_optimizers": [v.state_dict() for v in self.deform_optimizers],
+                    "sample_losses": sample_losses.clone(),
+                }
                 if self.deform_field is not None:
                     ckpt_data["deform_field"] = self.deform_field.state_dict()
                     ckpt_data["condition_min"] = self.parser.condition_min.tolist()
@@ -1455,23 +1637,37 @@ class Runner:
         # ====================================================================
         # Final Evaluation: 2x2 matrix (train/test conditions × seen/unseen views)
         # ====================================================================
+        print(f"\n{'='*70}")
+        print(f"FINAL EVALUATION: 2x2 Matrix")
         print(f"{'='*70}")
         
         # Training conditions: unseen views (this is the standard "val" eval)
-        print(f"\n--- TRAIN Conditions x UNSEEN Views ---")
-        self.eval_holdout(cfg.max_steps - 1, self.testset_train_unseen, "train_unseen")
-        
-        
+        if cfg.eval_train_unseen:
+            print(f"\n--- TRAIN Conditions x UNSEEN Views ---")
+            self.eval_holdout(cfg.max_steps - 1, self.testset_train_unseen, "train_unseen")
+
+        # Training conditions: seen views
+        if cfg.eval_train_seen:
+            print(f"\n--- TRAIN Conditions x SEEN Views ---")
+            self.eval_holdout(cfg.max_steps - 1, self.testset_train_seen, "train_seen")
+
         # Holdout/test conditions (if we have)
         if self.testset_holdout_unseen is not None:
-            print(f"\n--- TEST Conditions x UNSEEN Views ---")
-            self.eval_holdout(cfg.max_steps - 1, self.testset_holdout_unseen, "holdout_unseen")
-            
+            if cfg.eval_holdout_unseen:
+                print(f"\n--- TEST Conditions x UNSEEN Views ---")
+                self.eval_holdout(cfg.max_steps - 1, self.testset_holdout_unseen, "holdout_unseen")
+
+            if cfg.eval_holdout_seen:
+                print(f"\n--- TEST Conditions x SEEN Views ---")
+                self.eval_holdout(cfg.max_steps - 1, self.testset_holdout_seen, "holdout_seen")
+        
         # Print summary table
         self._print_evaluation_summary(cfg.max_steps - 1)
         
-
-
+        self.render_traj(cfg.max_steps - 1)
+        
+        # Report final stats
+        self._report_model_stats()
 
     @torch.no_grad()
     def _eval_stage1(self, step: int, valset):
@@ -1498,10 +1694,10 @@ class Runner:
                 colors = colors[..., 0:3] + (1.0 - alphas)
             colors = torch.clamp(colors, 0.0, 1.0)
 
-            # Save image
-            canvas = torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()
-            canvas = (canvas * 255).astype(np.uint8)
-            imageio.imwrite(f"{self.render_dir}/stage1_step{step}_{i:04d}.png", canvas)
+            if i < cfg.render_save_per_condition:
+                canvas = torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()
+                canvas = (canvas * 255).astype(np.uint8)
+                imageio.imwrite(f"{self.render_dir}/stage1_step{step}_{i:04d}.png", canvas)
 
             pixels_p = pixels.permute(0, 3, 1, 2)
             colors_p = colors.permute(0, 3, 1, 2)
@@ -1809,7 +2005,10 @@ class Runner:
         
         # Track per-condition camera index for better naming
         per_condition_cam_count = defaultdict(int)
-        
+
+
+        rendered_conditions = set()
+
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
@@ -1854,23 +2053,24 @@ class Runner:
             canvas_list = [pixels, colors]
 
             if world_rank == 0:
-                # write images with informative naming
-                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-                canvas = (canvas * 255).astype(np.uint8)
-                
-                # Use condition-aware naming for deformation mode
                 if cfg.use_deformation and condition_idx is not None:
-                    # Track which camera we're on for this condition
                     cam_num = per_condition_cam_count[condition_idx]
                     per_condition_cam_count[condition_idx] += 1
-                    
-                    # Format: val_step49999_cond003_cam0012.png
+
+                    if condition_idx not in rendered_conditions and len(rendered_conditions) < cfg.render_save_conditions:
+                        rendered_conditions.add(condition_idx)
+
+
+                    save_image = condition_idx in rendered_conditions and cam_num < cfg.render_save_per_condition
                     filename = f"{stage}_step{step}_cond{condition_idx:03d}_cam{cam_num:04d}.png"
                 else:
-                    # Standard naming for non-deformation mode
+                    save_image = i < cfg.render_save_per_condition
                     filename = f"{stage}_step{step}_{i:04d}.png"
-                
-                imageio.imwrite(f"{self.render_dir}/{filename}", canvas)
+
+                if save_image:
+                    canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
+                    canvas = (canvas * 255).astype(np.uint8)
+                    imageio.imwrite(f"{self.render_dir}/{filename}", canvas)
 
                 pixels_p = pixels.permute(0, 3, 1, 2)
                 colors_p = colors.permute(0, 3, 1, 2)
@@ -1990,7 +2190,10 @@ class Runner:
         metrics = defaultdict(list)
         per_condition_metrics = defaultdict(lambda: defaultdict(list))
         per_condition_cam_count = defaultdict(int)
-        
+        # Conditions selected (in encounter order) to have example renders
+        # saved. Metrics below are still computed for every sample regardless.
+        rendered_conditions = set()
+
         for i, data in enumerate(tqdm.tqdm(valloader, desc=f"Evaluating {name}")):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
@@ -2025,14 +2228,20 @@ class Runner:
             canvas_list = [pixels, colors]
 
             if world_rank == 0:
-                # Write images
-                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
-                canvas = (canvas * 255).astype(np.uint8)
-                
                 cam_num = per_condition_cam_count[condition_idx]
                 per_condition_cam_count[condition_idx] += 1
-                filename = f"{name}_step{step}_cond{condition_idx:03d}_cam{cam_num:04d}.png"
-                imageio.imwrite(f"{self.render_dir}/{filename}", canvas)
+
+                if condition_idx not in rendered_conditions and len(rendered_conditions) < cfg.render_save_conditions:
+                    rendered_conditions.add(condition_idx)
+
+                # Save only the first `render_save_conditions` conditions
+                # encountered, capped at `render_save_per_condition`
+                # cameras each.
+                if condition_idx in rendered_conditions and cam_num < cfg.render_save_per_condition:
+                    canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
+                    canvas = (canvas * 255).astype(np.uint8)
+                    filename = f"{name}_step{step}_cond{condition_idx:03d}_cam{cam_num:04d}.png"
+                    imageio.imwrite(f"{self.render_dir}/{filename}", canvas)
 
                 pixels_p = pixels.permute(0, 3, 1, 2)
                 colors_p = colors.permute(0, 3, 1, 2)

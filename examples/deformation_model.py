@@ -1,8 +1,31 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+# from torch.utils.checkpoint import checkpoint  # unused now — checkpointing reverted, see DeformationMLP.forward
 from typing import Optional, Tuple
 import math
+
+
+class BF16LayerNorm(nn.LayerNorm):
+    """LayerNorm that computes directly in its input's dtype instead of
+    being forced to fp32 by `torch.autocast`. Under bf16 autocast, every
+    plain nn.LayerNorm call round-trips its (N, hidden_dim) activation
+    fp32<->bf16 on top of the norm itself — profiling showed this cast
+    traffic alone eating ~30% of step time at N ~= 1e6 gaussians, more
+    than the actual matmuls. It's dead weight: PyTorch's native CUDA
+    layer_norm kernel already accumulates mean/var in a float32
+    accumulator internally regardless of the input/output dtype (that's
+    why fp16 needs the forced promotion for range/overflow safety, but
+    bf16 — with fp32's exponent range — doesn't). Running on the tensor's
+    existing dtype skips the redundant copies with no change in the
+    reduction's actual precision.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.autocast(device_type="cuda", enabled=False):
+            weight = self.weight.to(x.dtype) if self.weight is not None else None
+            bias = self.bias.to(x.dtype) if self.bias is not None else None
+            return F.layer_norm(x, self.normalized_shape, weight, bias, self.eps)
 
 
 class PositionalEncoding(nn.Module):
@@ -37,13 +60,13 @@ class ConditionEncoder(nn.Module):
         condition_dim: int = 3,
         output_dim: int = 32,
         hidden_dim: int = 64,
-        num_freqs: int = 2,    
+        num_freqs: int = 2,           # LOW — smooth for generalisation
     ):
         super().__init__()
         self.pos_enc = PositionalEncoding(condition_dim, num_freqs=num_freqs)
         self.mlp = nn.Sequential(
             nn.Linear(self.pos_enc.output_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            BF16LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, output_dim),
         )
@@ -60,10 +83,10 @@ class SpatialEncoder(nn.Module):
         self.pos_enc = PositionalEncoding(3, num_freqs=num_freqs)
         self.mlp = nn.Sequential(
             nn.Linear(self.pos_enc.output_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            BF16LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            BF16LayerNorm(hidden_dim),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim, output_dim),
         )
@@ -73,14 +96,43 @@ class SpatialEncoder(nn.Module):
         return self.mlp(encoded)
 
 
+class FiLMModulation(nn.Module):
+    """
+    Feature-wise Linear Modulation: condition modulates spatial features
+    via learned per-channel scale (gamma) and shift (beta).
+
+        out = gamma(condition) * spatial_feat + beta(condition)
+    """
+
+    def __init__(self, cond_dim: int, feat_dim: int):
+        super().__init__()
+        self.fc = nn.Linear(cond_dim, feat_dim * 2)
+        nn.init.zeros_(self.fc.weight)
+        nn.init.zeros_(self.fc.bias)
+        self.fc.bias.data[:feat_dim] = 1.0   # gamma=1, beta=0 at init
+
+    def forward(self, cond: torch.Tensor, feat: torch.Tensor) -> torch.Tensor:
+        gamma_beta = self.fc(cond)
+        gamma, beta = gamma_beta.chunk(2, dim=-1)
+        return gamma * feat + beta
+
 
 class BottleneckAdapter(nn.Module):
+    """
+    Bottleneck MLP adapter: condition features are projected through a
+    low-rank bottleneck to produce delta features that are added to
+    spatial features.
+
+        out = spatial_feat + adapter(cond)
+    
+    Zero-initialized output so the model starts as identity (no shift).
+    """
 
     def __init__(self, cond_dim: int, feat_dim: int, bottleneck_dim: int = 16):
         super().__init__()
         self.adapter = nn.Sequential(
             nn.Linear(cond_dim, bottleneck_dim),
-            nn.LayerNorm(bottleneck_dim),
+            BF16LayerNorm(bottleneck_dim),
             nn.ReLU(inplace=True),
             nn.Linear(bottleneck_dim, feat_dim),
         )
@@ -99,45 +151,50 @@ class DeformationMLP(nn.Module):
         self.learn_alpha = learn_alpha
         self.learn_sh = learn_sh
         
-        layers = [nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU(inplace=True)]
+        layers = [nn.Linear(input_dim, hidden_dim), BF16LayerNorm(hidden_dim), nn.ReLU(inplace=True)]
         for _ in range(num_layers - 2):
-            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU(inplace=True)])
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), BF16LayerNorm(hidden_dim), nn.ReLU(inplace=True)])
         self.backbone = nn.Sequential(*layers)
         
+        # self.delta_xyz = nn.Linear(hidden_dim, 3)
         self.delta_xyz = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            BF16LayerNorm(hidden_dim),
             nn.ReLU(inplace=True), 
             nn.Linear(hidden_dim, 3)
         )
 
+        # self.delta_rot = nn.Linear(hidden_dim, 4)
         self.delta_rot = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            BF16LayerNorm(hidden_dim),
             nn.ReLU(inplace=True), 
             nn.Linear(hidden_dim, 4)
         )
 
+        # self.delta_scale = nn.Linear(hidden_dim, 3)
         self.delta_scale = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            BF16LayerNorm(hidden_dim),
             nn.ReLU(inplace=True), 
             nn.Linear(hidden_dim, 3)
         )
+        # self.delta_alpha = nn.Linear(hidden_dim, 1) if learn_alpha else None  
         if learn_alpha:
             self.delta_alpha = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.ReLU(inplace=True),               
+                BF16LayerNorm(hidden_dim),
+                nn.ReLU(inplace=True),               # nn.ReLU(inplace=True), nn.GELU()
                 nn.Linear(hidden_dim, 1)
             )
         else:
             self.delta_alpha = None
         
+        # self.delta_sh = nn.Linear(hidden_dim, sh_dim) if learn_sh else None
         if learn_sh:
             self.delta_sh = nn.Sequential(
                 nn.Linear(hidden_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
+                BF16LayerNorm(hidden_dim),
                 nn.ReLU(inplace=True),  
                 nn.Linear(hidden_dim, sh_dim)
             )
@@ -166,10 +223,20 @@ class DeformationMLP(nn.Module):
         h = self.backbone(features)
         delta_alpha = self.delta_alpha(h) if self.learn_alpha else None
         delta_sh = self.delta_sh(h) if self.learn_sh else None
-        return self.delta_xyz(h), self.delta_rot(h), self.delta_scale(h), delta_alpha, delta_sh
+        delta_rot = self.delta_rot(h)
+        return self.delta_xyz(h), delta_rot, self.delta_scale(h), delta_alpha, delta_sh
 
 
 class DeformationField(nn.Module):
+    """
+    Condition-driven deformation field for Gaussian splatting.
+    
+    Concatenates spatial encoding (from Gaussian positions) with condition
+    encoding (from simulation parameters) and predicts per-Gaussian deltas
+    for position, rotation, scale, and optionally opacity and SH coefficients.
+    
+    Works with any condition_dim (3 for Nyx, 6 for Cloverleaf, etc.).
+    """
     
     def __init__(
         self,
@@ -181,9 +248,10 @@ class DeformationField(nn.Module):
         learn_alpha: bool = False,
         learn_sh: bool = False,
         sh_dim: int = 48,
+        use_adapter: bool = True,
     ):
         super().__init__()
-        
+
         self.condition_dim = condition_dim
         self.deform_scale = deform_scale
         self.alpha_scale = deform_scale #* 10
@@ -193,27 +261,29 @@ class DeformationField(nn.Module):
         self.learn_alpha = learn_alpha
         self.learn_sh = learn_sh
         self.sh_dim = sh_dim
-        
+        self.use_adapter = use_adapter
+
         spatial_out = feature_dim
         cond_out = feature_dim
         bottleneck_dim = feature_dim #// 4
-        
+
         self.spatial_encoder = SpatialEncoder(
-            output_dim=spatial_out, 
+            output_dim=spatial_out,
             hidden_dim=hidden_dim
         )
-        
+
         self.condition_encoder = ConditionEncoder(
             condition_dim=condition_dim,
             output_dim=cond_out,
             hidden_dim=hidden_dim,
         )
-        
-        # Bottleneck adapter: condition shifts spatial features additively
-        self.adapter = BottleneckAdapter(
-            cond_dim=cond_out, feat_dim=spatial_out, bottleneck_dim=bottleneck_dim
-        )
-        
+
+
+        if self.use_adapter:
+            self.adapter = BottleneckAdapter(
+                cond_dim=cond_out, feat_dim=spatial_out, bottleneck_dim=bottleneck_dim
+            )
+
         self.mlp = DeformationMLP(
             input_dim=spatial_out,
             hidden_dim=hidden_dim,
@@ -234,8 +304,12 @@ class DeformationField(nn.Module):
         
         spatial_feat = self.spatial_encoder(xyz_norm)
         cond_feat = self.condition_encoder(condition_vector)
-        features = self.adapter(cond_feat, spatial_feat)
-        
+        if self.use_adapter:
+            features = self.adapter(cond_feat, spatial_feat)
+        else:
+            # ABLATION: no adapter -- direct elementwise fusion.
+            features = spatial_feat + cond_feat
+
         return self.mlp(features)
     
     def apply_deformation(
@@ -287,6 +361,7 @@ def create_deformation_field(
     learn_alpha: bool = False,
     learn_sh: bool = False,
     sh_dim: int = 48,
+    use_adapter: bool = True,
 ) -> DeformationField:
     return DeformationField(
         condition_dim=condition_dim,
@@ -297,11 +372,10 @@ def create_deformation_field(
         learn_alpha=learn_alpha,
         learn_sh=learn_sh,
         sh_dim=sh_dim,
+        use_adapter=use_adapter,
     )
 
 
 
-# ============================================================================
-# ============================================================================
 NyxDeformationField = DeformationField
 create_nyx_deformation_field = create_deformation_field

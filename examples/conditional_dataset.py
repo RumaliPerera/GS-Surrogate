@@ -113,6 +113,30 @@ def qvec2rotmat(qvec: np.ndarray) -> np.ndarray:
 # ============================================================================
 
 class ConditionalParser:
+    """
+    Generic parser for conditional multi-view datasets.
+    
+    Expected structure:
+        data_dir/
+            m0000/ or p001/    # Condition folders
+            m0001/ or p002/
+            ...
+            sparse/0/           # Shared COLMAP
+            names.txt           # Condition vectors
+    
+    Folder naming conventions (auto-detected):
+        - 'm' prefix: 0-indexed (m0000 -> condition 0)
+        - 'p' prefix: 1-indexed (p001  -> condition 0)
+    
+    Condition dimensionality is auto-detected from names.txt.
+    
+    Args:
+        data_dir: Root directory
+        factor: Downsample factor for images
+        normalize: Whether to normalize scene coordinates
+        test_every: Every Nth image is used for testing
+        names_file: Name of the conditions file (default: "names.txt")
+    """
     
     def __init__(
         self,
@@ -130,7 +154,7 @@ class ConditionalParser:
         # Parse condition vectors from names.txt (auto-detect dim)
         self._parse_conditions(names_file)
         
-        # Find condition folders
+        # Find condition folders (auto-detect 'm' vs 'p' prefix)
         self._find_condition_folders()
         
         # Parse COLMAP data
@@ -194,6 +218,9 @@ class ConditionalParser:
                     f"All conditions must have the same dimensionality."
                 )
         
+        # Compute min-max normalization stats for conditions
+        # Maps conditions to [0, 1] — better for HexPlane line indexing,
+        # positional encoding, and generalization to unseen conditions.
         all_vecs = np.stack(list(self.condition_vectors.values()))
         self.condition_min = all_vecs.min(axis=0)
         self.condition_max = all_vecs.max(axis=0)
@@ -208,6 +235,8 @@ class ConditionalParser:
         """Find condition folders. Supports 'p' prefix (0-indexed) and 'p' prefix (1-indexed)."""
         self.condition_folders = {}  # condition_idx -> Path
         
+        
+        # Fallback to 'p' prefix (1-indexed: p001 -> condition 0)
         if len(self.condition_folders) == 0:
             for folder in sorted(self.data_dir.iterdir()):
                 if folder.is_dir() and folder.name.startswith('p'):
@@ -251,8 +280,7 @@ class ConditionalParser:
             self.points = np.random.randn(10000, 3).astype(np.float32) * 0.5
             self.points_rgb = np.random.randint(0, 255, (10000, 3)).astype(np.uint8)
         
-        # Build camera matrices — collect first, then sort by image name
-        # (gsplat sorts by np.argsort(image_names) for consistent ordering)
+
         _camtoworlds = []
         _Ks = []
         _image_names = []
@@ -313,7 +341,7 @@ class ConditionalParser:
             _heights.append(int(height))
             _widths.append(int(width))
         
-        # Sort by image name (alphabetical) to match gsplat's Parser behavior:
+
         inds = np.argsort(_image_names)
         self.camtoworlds = np.stack([_camtoworlds[i] for i in inds])
         self.Ks = np.stack([_Ks[i] for i in inds])
@@ -349,7 +377,12 @@ class ConditionalParser:
         print(f"  Scene scale (post-norm): {self.scene_scale:.4f}")
     
     def _build_samples(self):
-
+        """Build list of (condition_idx, camera_idx, image_path) samples.
+        
+        Images are matched to cameras by filename, not positional index.
+        This is robust even if image naming conventions differ slightly
+        between condition folders and COLMAP.
+        """
         self.all_samples = []
         
         # Build name-stem -> camera_idx lookup from the sorted camera list
@@ -494,18 +527,67 @@ class ConditionalDataset(TorchDataset):
                 K[1, 2] -= y
         
         return {
-            "image": torch.from_numpy(image),                    
-            "camtoworld": torch.from_numpy(camtoworld),          
-            "K": torch.from_numpy(K),                            
-            "condition_idx": cond_idx,                          
-            "condition_vector": torch.from_numpy(cond_vec),     
-            "camera_idx": cam_idx,                         
-            "image_id": cam_idx,                            
-            "sample_idx": idx,                       
+            "image": torch.from_numpy(image),                    # [H, W, 3]
+            "camtoworld": torch.from_numpy(camtoworld),          # [4, 4]
+            "K": torch.from_numpy(K),                            # [3, 3]
+            "condition_idx": cond_idx,                           # int
+            "condition_vector": torch.from_numpy(cond_vec),      # [condition_dim]
+            "camera_idx": cam_idx,                               # int (for image_ids)
+            "image_id": cam_idx,                                 # alias for compatibility
+            "sample_idx": idx,                                   # for loss-weighted sampling
         }
 
 
-# ============================================================================
-# ============================================================================
+
 NyxParser = ConditionalParser
 NyxDataset = ConditionalDataset
+
+
+# ============================================================================
+# In-memory preloading
+# ============================================================================
+
+def preload_to_memory(dataset: "ConditionalDataset") -> Dict[str, torch.Tensor]:
+    """Eagerly decode every sample once and stack into contiguous CPU tensors.
+
+    ConditionalDataset.__getitem__ re-opens and re-decodes an image from disk
+    on every call, which DataLoader workers otherwise have to redo on every
+    single training step. A full training split here is only a few GB, so
+    it's cheaper to decode it once up front and index into RAM afterwards.
+    Assumes every sample has the same image resolution (true whenever
+    patch_size is None and parser.factor is fixed, as in this dataset).
+    """
+    n = len(dataset)
+    assert n > 0, "Cannot preload an empty dataset."
+
+    first = dataset[0]
+    h, w = first["image"].shape[:2]
+    cond_dim = first["condition_vector"].shape[0]
+
+    images = torch.empty((n, h, w, 3), dtype=torch.uint8)
+    camtoworlds = torch.empty((n, 4, 4), dtype=torch.float32)
+    Ks = torch.empty((n, 3, 3), dtype=torch.float32)
+    condition_vectors = torch.empty((n, cond_dim), dtype=torch.float32)
+    condition_idx = torch.empty((n,), dtype=torch.long)
+    camera_idx = torch.empty((n,), dtype=torch.long)
+
+    def _store(i: int, sample: Dict[str, Any]) -> None:
+        images[i] = sample["image"].to(torch.uint8)
+        camtoworlds[i] = sample["camtoworld"]
+        Ks[i] = sample["K"]
+        condition_vectors[i] = sample["condition_vector"]
+        condition_idx[i] = int(sample["condition_idx"])
+        camera_idx[i] = int(sample["camera_idx"])
+
+    _store(0, first)
+    for i in range(1, n):
+        _store(i, dataset[i])
+
+    return {
+        "images": images,
+        "camtoworlds": camtoworlds,
+        "Ks": Ks,
+        "condition_vectors": condition_vectors,
+        "condition_idx": condition_idx,
+        "camera_idx": camera_idx,
+    }
