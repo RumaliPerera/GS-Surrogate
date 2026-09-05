@@ -96,21 +96,6 @@ Metrics reported: **PSNR**, **SSIM**, **LPIPS**.
 
 ```
 
-## 📄 Citation
 
-If you find GS-Surrogate useful for your research, please cite:
-
-```bibtex
-@article{li2026gs,
-  title={GS-Surrogate: Deformable Gaussian Splatting for Parameter Space Exploration of Ensemble Simulations},
-  author={Li, Ziwei and Perera, Rumali and Forbes, Angus and Moreland, Ken and Pugmire, Dave and Klasky, Scott and Chao, Wei-Lun and Shen, Han-Wei},
-  journal={arXiv preprint arXiv:2604.06358},
-  year={2026}
-}
-```
-
-## 🏆 Acknowledgements
-
-This work was supported by the U.S. Department of Energy, Office of Science, Office of Advanced Scientific Computing Research’s Computer Science Competitive Portfolios program under Contract No. DEAC05-00OR22725. This research used resources of the Oak Ridge Leadership Computing Facility at the Oak Ridge National Laboratory, which is supported by the Advanced Scientific Computing Research programs in the Office of Science of the U.S. Department of Energy under Contract No. DE-AC05-00OR22725.
 
 
