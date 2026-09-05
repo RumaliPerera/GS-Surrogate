@@ -92,8 +92,6 @@ Evaluation runs automatically at the end of training, reporting a 2×2 matrix of
 | **Test Conditions (holdout)** | ✓ | ✓ |
 
 Metrics reported: **PSNR**, **SSIM**, **LPIPS**.
-
-
 ```
 
 
