@@ -1,0 +1,12 @@
+python inference_tf.py \
+    --data_dir "/path/to/Nyx_Dataset_TFs" \
+    --tf_ckpt /path/to/tf_adapter/ckpts/ckpt_99999_rank0.pt \
+    --vol_ckpt /path/to/volume_model/ckpts/ckpt_109999_rank0.pt \
+    --sim_params 0.13733 0.02178 0.46625 \
+    --tf_residual 0.0 0.0 0.0 0.0 \
+    --deform_scale 1.0 \
+    --tf_alpha_scale 1.0 \
+    --tf_sh_scale 1.0 \
+    --learn_deform_alpha --learn_deform_sh \
+    --all_views \
+    --output_dir rendered_sim_0.13733_0.02178_0.46625_tf_0.0_0.0_0.0_0.0
